@@ -2,7 +2,10 @@ package main
 
 import (
 	"database/sql"
+	"sync"
 	"testing"
+
+	_ "github.com/lib/pq"
 )
 
 func setupTestDB(t *testing.T) *sql.DB {
@@ -61,4 +64,55 @@ func TestPurchase_Success(t *testing.T) {
 	if count != 1 {
 		t.Errorf("Expected 1 order to be created, got %d", count)
 	}
+}
+
+func TestPurchase_Concurrent_RaceCondition(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	const initialStock = 10
+	_, err := db.Exec("INSERT INTO products (id, name, stock) VALUES (1, 'Flash Sale Sneakers', $1)", initialStock)
+	if err != nil {
+		t.Fatalf("Failed to seed product: %v", err)
+	}
+
+	const totalUsers = 50
+	var wg sync.WaitGroup
+	errChan := make(chan error, totalUsers)
+
+	for i := 1; i <= totalUsers; i++ {
+		wg.Add(1)
+		go func(userID int) {
+			defer wg.Done()
+			err := Purchase(db, 1, userID)
+			if err != nil {
+				errChan <- err
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	var failedPurchases int
+	for range errChan {
+		failedPurchases++
+	}
+
+	var finalStock int
+	_ = db.QueryRow("SELECT stock FROM products WHERE id = 1").Scan(&finalStock)
+
+	var totalOrders int
+	_ = db.QueryRow("SELECT COUNT(*) FROM orders WHERE product_id = 1").Scan(&totalOrders)
+
+	t.Logf("--> Results: Initial Stock: %d | Final Stock: %d | Total Orders Created: %d", initialStock, finalStock, totalOrders)
+
+	if finalStock < 0 {
+		t.Errorf("CRITICAL INVARIANT VIOLATION: Negative stock detected! Final stock: %d", finalStock)
+	}
+
+	if totalOrders > initialStock {
+		t.Errorf("CRITICAL INVARIANT VIOLATION: Oversold! Sold %d items when only %d existed", totalOrders, initialStock)
+	}
+
 }
