@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -21,25 +22,52 @@ var luaDeductStock = redis.NewScript(`
 	return 1
 `)
 
-func Purchase(ctx context.Context, db *sql.DB, rdb *redis.Client, productID int, userID int) error {
-	stockKey := "product:" + strconv.Itoa(productID) + ":stock"
+func Purchase(ctx context.Context, db *sql.DB, rdb *redis.Client, productID int, userID int, idempotencyKey string) error {
+	idKey := "idempotency:" + idempotencyKey
 
-	result, err := luaDeductStock.Run(ctx, rdb, []string{stockKey}).Result()
+	setSuccess, err := rdb.SetNX(ctx, idKey, "PROCESSING", 10*time.Second).Result()
 	if err != nil {
 		return err
 	}
 
+	if !setSuccess {
+		status, err := rdb.Get(ctx, idKey).Result()
+		if err != nil {
+			return err
+		}
+		if status == "PROCESSING" {
+			return errors.New("request conflict: transaction is already in-flight or completed")
+		}
+		if status == "SUCCESS" {
+			return nil
+		}
+	}
+
+	removeIdempotencyToken := func() {
+		_ = rdb.Del(ctx, idKey).Err()
+	}
+
+	stockKey := "product:" + strconv.Itoa(productID) + ":stock"
+
+	result, err := luaDeductStock.Run(ctx, rdb, []string{stockKey}).Result()
+	if err != nil {
+		removeIdempotencyToken()
+		return err
+	}
+
 	if result.(int64) == 0 {
+		removeIdempotencyToken()
 		return errors.New("operational failure: product is out of stock in cache")
 	}
 
-	refundRedis := func() {
+	rollbackSystem := func() {
 		_ = rdb.Incr(ctx, stockKey).Err()
+		removeIdempotencyToken()
 	}
 
 	tx, err := db.Begin()
 	if err != nil {
-		refundRedis()
+		rollbackSystem()
 		return err
 	}
 
@@ -48,29 +76,34 @@ func Purchase(ctx context.Context, db *sql.DB, rdb *redis.Client, productID int,
 	var orderCount int
 	err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM orders WHERE product_id = $1 AND user_id = $2", productID, userID).Scan(&orderCount)
 	if err != nil {
-		refundRedis()
+		rollbackSystem()
 		return err
 	}
 	if orderCount > 0 {
-		refundRedis()
+		rollbackSystem()
 		return errors.New("purchase limit exceeded: user has already bought this product")
 	}
 
 	_, err = tx.ExecContext(ctx, "UPDATE products SET stock = stock - 1 WHERE id = $1", productID)
 	if err != nil {
-		refundRedis()
+		rollbackSystem()
 		return err
 	}
 
 	_, err = tx.ExecContext(ctx, "INSERT INTO orders (product_id, user_id) VALUES ($1, $2)", productID, userID)
 	if err != nil {
-		refundRedis()
+		rollbackSystem()
 		return err
 	}
 
 	err = tx.Commit()
 	if err != nil {
-		refundRedis()
+		rollbackSystem()
+		return err
+	}
+
+	err = rdb.Set(ctx, idKey, "SUCCESS", 24*time.Hour).Err()
+	if err != nil {
 		return err
 	}
 

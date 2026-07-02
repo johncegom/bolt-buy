@@ -41,7 +41,7 @@ func TestPurchase_Success(t *testing.T) {
 	_, _ = db.Exec("INSERT INTO products (id, name, stock) VALUES (1, 'Mechanical Keyboard', 10);")
 	_ = rdb.Set(ctx, "product:1:stock", 10, 0).Err()
 
-	err := Purchase(ctx, db, rdb, 1, 42)
+	err := Purchase(ctx, db, rdb, 1, 42, "single-user-happy-path-key")
 	if err != nil {
 		t.Fatalf("Expected successful purchase, got error: %v", err)
 	}
@@ -82,7 +82,9 @@ func TestPurchase_Concurrent_RedisAndPostgres(t *testing.T) {
 		wg.Add(1)
 		go func(userID int) {
 			defer wg.Done()
-			err := Purchase(ctx, db, rdb, productID, userID)
+
+			idKey := "concurrent-user-key" + strconv.Itoa(userID)
+			err := Purchase(ctx, db, rdb, productID, userID, idKey)
 			if err != nil {
 				errChan <- err
 			}
@@ -126,12 +128,12 @@ func TestPurchase_CacheDrift_OnFailure(t *testing.T) {
 	_, _ = db.Exec("INSERT INTO products (id, name, stock) VALUES ($1, 'Rare Vinyl Record', $2);", productID, initialStock)
 	_ = rdb.Set(ctx, "product:"+strconv.Itoa(productID)+":stock", initialStock, 0).Err()
 
-	err := Purchase(ctx, db, rdb, productID, userID)
+	err := Purchase(ctx, db, rdb, productID, userID, "drift-test-key-first-attempt")
 	if err != nil {
 		t.Fatalf("First purchase failed unexxpectedly: %v", err)
 	}
 
-	err = Purchase(ctx, db, rdb, productID, userID)
+	err = Purchase(ctx, db, rdb, productID, userID, "drift-test-key-second-attempt")
 	if err == nil {
 		t.Fatalf("Expected second purchase to fail for duplicate user, but it succeed")
 	}
@@ -147,5 +149,41 @@ func TestPurchase_CacheDrift_OnFailure(t *testing.T) {
 	if dbStock != redisStock {
 		t.Errorf("CACHE DRIFT DETECTED! DB stock is %d, but Redis stock is %d", dbStock, redisStock)
 	}
+}
 
+func TestPurchase_IdempotencyKey_BlocksDuplicateRetries(t *testing.T) {
+	ctx := context.Background()
+	db, rdb := setupTestInfra(t, ctx)
+	defer db.Close()
+	defer rdb.Close()
+
+	const initialStock = 5
+	productID := 1
+	userID := 100
+	sharedIdempotencyKey := "client-generated-uuid-v4-12345"
+
+	_, _ = db.Exec("INSERT INTO products (id, name, stock) VALUES ($1, 'Limited Edition Console', $2);", productID, initialStock)
+	_ = rdb.Set(ctx, "product:"+strconv.Itoa(productID)+":stock", initialStock, 0).Err()
+
+	err := Purchase(ctx, db, rdb, productID, userID, sharedIdempotencyKey)
+	if err != nil {
+		t.Fatalf("Initial purchase failed unexpectedly: %v", err)
+	}
+
+	err = Purchase(ctx, db, rdb, productID, userID, sharedIdempotencyKey)
+	if err == nil {
+		t.Fatalf("CRITICAL BUG: system allowed a duplicate request with an identical idempotency key to pass")
+	}
+
+	expectedErr := "request conflict: transaction is already in-flight or completed"
+	if err.Error() != expectedErr {
+		t.Errorf("Unexpected error message. Got: '%v', Expected: '%v'", err.Error(), expectedErr)
+	}
+
+	var dbStock int
+	_ = db.QueryRow("SELECT stock FROM products WHERE id = $1", productID).Scan(&dbStock)
+
+	if dbStock != 4 {
+		t.Errorf("state corrupted! Expected final stock to be 4, recorded: %d", dbStock)
+	}
 }
