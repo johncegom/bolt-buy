@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"strconv"
 	"sync"
 	"testing"
 
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
-func setupTestDB(t *testing.T) *sql.DB {
+func setupTestInfra(t *testing.T, ctx context.Context) (*sql.DB, *redis.Client) {
 	connStr := "postgres://bolt_user:bolt_password@localhost:6378/bolt_buy?sslmode=disable"
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
@@ -17,64 +20,59 @@ func setupTestDB(t *testing.T) *sql.DB {
 
 	_, _ = db.Exec("DROP TABLE IF EXISTS orders;")
 	_, _ = db.Exec("DROP TABLE IF EXISTS products;")
+	_, _ = db.Exec(`CREATE TABLE products (id SERIAL PRIMARY KEY, name VARCHAR(255), stock INT);`)
+	_, _ = db.Exec(`CREATE TABLE orders (id SERIAL PRIMARY KEY, product_id INT, user_id INT);`)
 
-	_, err = db.Exec(`CREATE TABLE products (id SERIAL PRIMARY KEY, name VARCHAR(255), stock INT);`)
-	if err != nil {
-		t.Fatalf("Failed to create products table: %v", err)
-	}
-	_, err = db.Exec(`CREATE TABLE orders (id SERIAL PRIMARY KEY, product_id INT, user_id INT);`)
-	if err != nil {
-		t.Fatalf("Failed to create orders table: %v", err)
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	if err := rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("Failed to flush Redis: %v", err)
 	}
 
-	return db
+	return db, rdb
 }
 
 func TestPurchase_Success(t *testing.T) {
-	db := setupTestDB(t)
+	ctx := context.Background()
+
+	db, rdb := setupTestInfra(t, ctx)
 	defer db.Close()
+	defer rdb.Close()
 
-	_, err := db.Exec("INSERT INTO products (id, name, stock) VALUES (1, 'Mechanical Keyboard', 10);")
-	if err != nil {
-		t.Fatalf("Failed to seed product: %v", err)
-	}
+	_, _ = db.Exec("INSERT INTO products (id, name, stock) VALUES (1, 'Mechanical Keyboard', 10);")
+	_ = rdb.Set(ctx, "product:1:stock", 10, 0).Err()
 
-	err = Purchase(db, 1, 42)
+	err := Purchase(ctx, db, rdb, 1, 42)
 	if err != nil {
 		t.Fatalf("Expected successful purchase, got error: %v", err)
 	}
 
-	// Assertion 1: Stock must be decremented by 1
+	// Assert Postgres state
 	var stock int
-	err = db.QueryRow("SELECT stock FROM products WHERE id = 1").Scan(&stock)
-
-	if err != nil {
-		t.Fatalf("Failed to check stock: %v", err)
-	}
+	_ = db.QueryRow("SELECT stock FROM products WHERE id = 1").Scan(&stock)
 	if stock != 9 {
 		t.Errorf("Expected stock to be 9, got %d", stock)
 	}
 
-	// Asserrtion 2: An order record must exist for this user
-	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM orders WHERE product_id = 1 AND user_id = 42").Scan(&count)
-	if err != nil {
-		t.Fatalf("Failed to check orders: %v", err)
-	}
-	if count != 1 {
-		t.Errorf("Expected 1 order to be created, got %d", count)
+	// Assert Redis
+	redisStockStr, _ := rdb.Get(ctx, "product:1:stock").Result()
+	redisStock, _ := strconv.Atoi(redisStockStr)
+	if redisStock != 9 {
+		t.Errorf("Expecpted Redis stock to be 9, got %d", redisStock)
 	}
 }
 
-func TestPurchase_Concurrent_RaceCondition(t *testing.T) {
-	db := setupTestDB(t)
+func TestPurchase_Concurrent_RedisAndPostgres(t *testing.T) {
+	ctx := context.Background()
+
+	db, rdb := setupTestInfra(t, ctx)
 	defer db.Close()
+	defer rdb.Close()
 
 	const initialStock = 10
-	_, err := db.Exec("INSERT INTO products (id, name, stock) VALUES (1, 'Flash Sale Sneakers', $1)", initialStock)
-	if err != nil {
-		t.Fatalf("Failed to seed product: %v", err)
-	}
+	productID := 1
+
+	_, _ = db.Exec("INSERT INTO products (id, name, stock) VALUES ($1, 'Flash Sale Sneakers', $2);", productID, initialStock)
+	_ = rdb.Set(ctx, "product:"+strconv.Itoa(productID)+":stock", initialStock, 0).Err()
 
 	const totalUsers = 50
 	var wg sync.WaitGroup
@@ -84,7 +82,7 @@ func TestPurchase_Concurrent_RaceCondition(t *testing.T) {
 		wg.Add(1)
 		go func(userID int) {
 			defer wg.Done()
-			err := Purchase(db, 1, userID)
+			err := Purchase(ctx, db, rdb, productID, userID)
 			if err != nil {
 				errChan <- err
 			}
@@ -94,25 +92,60 @@ func TestPurchase_Concurrent_RaceCondition(t *testing.T) {
 	wg.Wait()
 	close(errChan)
 
-	var failedPurchases int
-	for range errChan {
-		failedPurchases++
-	}
-
-	var finalStock int
-	_ = db.QueryRow("SELECT stock FROM products WHERE id = 1").Scan(&finalStock)
+	var finalDBStock int
+	_ = db.QueryRow("SELECT stock FROM products WHERE id = $1", productID).Scan(&finalDBStock)
 
 	var totalOrders int
-	_ = db.QueryRow("SELECT COUNT(*) FROM orders WHERE product_id = 1").Scan(&totalOrders)
+	_ = db.QueryRow("SELECT COUNT(*) FROM orders WHERE product_id = $1", productID).Scan(&totalOrders)
 
-	t.Logf("--> Results: Initial Stock: %d | Final Stock: %d | Total Orders Created: %d", initialStock, finalStock, totalOrders)
+	redisStockStr, _ := rdb.Get(ctx, "product:"+strconv.Itoa(productID)+":stock").Result()
+	finalRedisStock, _ := strconv.Atoi(redisStockStr)
 
-	if finalStock < 0 {
-		t.Errorf("CRITICAL INVARIANT VIOLATION: Negative stock detected! Final stock: %d", finalStock)
+	t.Logf("--> Results: DB Stock: %d | Redis Stock: %d | Orders Created: %d", finalDBStock, finalRedisStock, totalOrders)
+
+	if finalDBStock != 0 || finalRedisStock != 0 {
+		t.Errorf("Inventory mismatch. DB: %d, Redis: %d", finalDBStock, finalRedisStock)
 	}
 
-	if totalOrders > initialStock {
-		t.Errorf("CRITICAL INVARIANT VIOLATION: Oversold! Sold %d items when only %d existed", totalOrders, initialStock)
+	if totalOrders != initialStock {
+		t.Errorf("Invariant broken! Expected exactly %d orders, but got %d", initialStock, totalOrders)
+	}
+
+}
+
+func TestPurchase_CacheDrift_OnFailure(t *testing.T) {
+	ctx := context.Background()
+	db, rdb := setupTestInfra(t, ctx)
+	defer db.Close()
+	defer rdb.Close()
+
+	const initialStock = 5
+	productID := 1
+	userID := 99
+
+	_, _ = db.Exec("INSERT INTO products (id, name, stock) VALUES ($1, 'Rare Vinyl Record', $2);", productID, initialStock)
+	_ = rdb.Set(ctx, "product:"+strconv.Itoa(productID)+":stock", initialStock, 0).Err()
+
+	err := Purchase(ctx, db, rdb, productID, userID)
+	if err != nil {
+		t.Fatalf("First purchase failed unexxpectedly: %v", err)
+	}
+
+	err = Purchase(ctx, db, rdb, productID, userID)
+	if err == nil {
+		t.Fatalf("Expected second purchase to fail for duplicate user, but it succeed")
+	}
+
+	var dbStock int
+	_ = db.QueryRow("SELECT stock FROM products WHERE id = $1", productID).Scan(&dbStock)
+
+	redisStockStr, _ := rdb.Get(ctx, "product:"+strconv.Itoa(productID)+":stock").Result()
+	redisStock, _ := strconv.Atoi(redisStockStr)
+
+	t.Logf("--> Drif Analysis: DB Stock: %d | Redis Stock: %d", dbStock, redisStock)
+
+	if dbStock != redisStock {
+		t.Errorf("CACHE DRIFT DETECTED! DB stock is %d, but Redis stock is %d", dbStock, redisStock)
 	}
 
 }
