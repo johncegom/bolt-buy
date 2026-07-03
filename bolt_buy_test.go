@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
@@ -151,7 +152,7 @@ func TestPurchase_CacheDrift_OnFailure(t *testing.T) {
 	}
 }
 
-func TestPurchase_IdempotencyKey_BlocksDuplicateRetries(t *testing.T) {
+func TestPurchase_IdempotencyKey_ProductionBehavior(t *testing.T) {
 	ctx := context.Background()
 	db, rdb := setupTestInfra(t, ctx)
 	defer db.Close()
@@ -160,19 +161,21 @@ func TestPurchase_IdempotencyKey_BlocksDuplicateRetries(t *testing.T) {
 	const initialStock = 5
 	productID := 1
 	userID := 100
-	sharedIdempotencyKey := "client-generated-uuid-v4-12345"
+	idempotencyKey := "client-generated-uuid-v4-12345"
+	targetKey := "idempotency:" + idempotencyKey
 
 	_, _ = db.Exec("INSERT INTO products (id, name, stock) VALUES ($1, 'Limited Edition Console', $2);", productID, initialStock)
 	_ = rdb.Set(ctx, "product:"+strconv.Itoa(productID)+":stock", initialStock, 0).Err()
 
-	err := Purchase(ctx, db, rdb, productID, userID, sharedIdempotencyKey)
-	if err != nil {
-		t.Fatalf("Initial purchase failed unexpectedly: %v", err)
-	}
+	// -----------------------------------------------------
+	// Test In-Flight Blocking ("PROCESSING")
+	// -----------------------------------------------------
 
-	err = Purchase(ctx, db, rdb, productID, userID, sharedIdempotencyKey)
+	_ = rdb.Set(ctx, targetKey, "PROCESSING", 10*time.Second).Err()
+
+	err := Purchase(ctx, db, rdb, productID, userID, idempotencyKey)
 	if err == nil {
-		t.Fatalf("CRITICAL BUG: system allowed a duplicate request with an identical idempotency key to pass")
+		t.Fatalf("CRITICAL FLAW: Allowed an in-flight request retry to pass through")
 	}
 
 	expectedErr := "request conflict: transaction is already in-flight or completed"
@@ -180,10 +183,38 @@ func TestPurchase_IdempotencyKey_BlocksDuplicateRetries(t *testing.T) {
 		t.Errorf("Unexpected error message. Got: '%v', Expected: '%v'", err.Error(), expectedErr)
 	}
 
+	_ = rdb.Del(ctx, targetKey).Err()
+
+	// -----------------------------------------------------
+	// Test Succesful Ingestion
+	// -----------------------------------------------------
+	err = Purchase(ctx, db, rdb, productID, userID, idempotencyKey)
+	if err != nil {
+		t.Fatalf("Initial genuine purchase failed unexpectedly: %v", err)
+	}
+
+	// -----------------------------------------------------
+	// Test Completed Retry ("SUCCESS")
+	// -----------------------------------------------------
+	err = Purchase(ctx, db, rdb, productID, userID, idempotencyKey)
+	if err != nil {
+		t.Fatalf("Expected retry of completed transaction to return nil (cache success), got error : %v", err)
+	}
+
+	// -----------------------------------------------------
+	// State Validation
+	// -----------------------------------------------------
+
 	var dbStock int
 	_ = db.QueryRow("SELECT stock FROM products WHERE id = $1", productID).Scan(&dbStock)
 
 	if dbStock != 4 {
-		t.Errorf("state corrupted! Expected final stock to be 4, recorded: %d", dbStock)
+		t.Errorf("INVARIANT VIOLATION: Completed retry mutated data! Expected stock to be 4, found: %d", dbStock)
+	}
+
+	var orderCount int
+	_ = db.QueryRow("SELECT COUNT(*) FROM orders WHERE product_id = $1 AND user_id = $2", productID, userID).Scan(&orderCount)
+	if orderCount != 1 {
+		t.Errorf("INVARIANT VIOLATION: Completed retry created a duplicate order! Found count: %d", orderCount)
 	}
 }
