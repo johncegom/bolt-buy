@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -217,4 +219,40 @@ func TestPurchase_IdempotencyKey_ProductionBehavior(t *testing.T) {
 	if orderCount != 1 {
 		t.Errorf("INVARIANT VIOLATION: Completed retry created a duplicate order! Found count: %d", orderCount)
 	}
+}
+
+func BenchmarkPurchase_Parallel(b *testing.B) {
+	ctx := context.Background()
+
+	db, rdb := setupTestInfra(nil, ctx)
+	defer db.Close()
+	defer rdb.Close()
+
+	const massiveStock = 1000000
+	productID := 999
+
+	_, err := db.Exec("INSERT INTO products (id, name, stock) VALUES ($1, 'Load Test Item', $2);", productID, massiveStock)
+	if err != nil {
+		b.Fatalf("Failed to seed benchmark DB: %v", err)
+	}
+
+	err = rdb.Set(ctx, "product:"+strconv.Itoa(productID)+":stock", massiveStock, 0).Err()
+	if err != nil {
+		b.Fatalf("Failed to seed benchmark Redis: %v", err)
+	}
+
+	b.ResetTimer()
+
+	var dynamicUserSequence int64 = 0
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			currentID := atomic.AddInt64(&dynamicUserSequence, 1)
+
+			userID := int(currentID)
+			idempotencyKey := fmt.Sprintf("bench-uuid-%d", currentID)
+
+			_ = Purchase(ctx, db, rdb, productID, userID, idempotencyKey)
+		}
+	})
 }
