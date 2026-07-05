@@ -1,11 +1,11 @@
-# Bolt Buy ⚡
+# Bolt Buy
 
 A high-performance, concurrent purchase processing system built in Go. 
 
 > [!IMPORTANT]
 > **No AI Disclaimer**: This project is built entirely without the use of AI/machine learning models. It is a pure, hands-on software engineering project designed to study, implement, and benchmark foundational distributed system concepts.
 
-## ⚠️ The Problem Statement
+## The Problem Statement
 
 During high-traffic events (such as flash sales, ticket releases, or limited-run product drops), transactional systems face major stability and consistency challenges:
 * **Database Saturation (Thundering Herd):** A massive spike of concurrent reads and writes hitting a relational database simultaneously can exhaust connection pools, increase latency, and cause system outages.
@@ -15,7 +15,7 @@ During high-traffic events (such as flash sales, ticket releases, or limited-run
 
 **Bolt Buy** solves these problems by coordinating an in-memory cache and a relational database using atomic scripts, transactional rollbacks, and idempotency locks to guarantee consistency at high throughput.
 
-## 🎓 Systems Concepts Taught & Learned
+## Systems Concepts Taught & Learned
 
 This project demonstrates how to build resilient, consistent, and fast transaction systems by coordinating a fast in-memory cache (**Redis**) and a persistent relational database (**PostgreSQL**). The key system concepts covered include:
 
@@ -43,7 +43,7 @@ The test suite utilizes Go’s built-in testing packages to perform:
 
 ---
 
-## 🛠️ Infrastructure Setup
+## Infrastructure Setup
 
 To spin up the PostgreSQL and Redis containers, run:
 
@@ -54,7 +54,7 @@ docker-compose up -d
 * **PostgreSQL:** Port `6378`
 * **Redis:** Port `6379`
 
-## 🧪 Running Tests & Benchmarks
+## Running Tests & Benchmarks
 
 Run the tests to verify concurrency behavior, idempotency guarantees, and cache drift protections:
 
